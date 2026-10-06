@@ -1,0 +1,470 @@
+# Home Lab – Docker Compose stack
+# Requires Docker Compose v2.24+ (optional env_file with `required: false`).
+# `kindle` and `rss` build from local ./kindle and ./rss and sit behind the "custom" profile;
+# enable them with COMPOSE_PROFILES=custom in .env.
+# Secrets and host-specific values live in .env (see .env.example).
+# Optional, non-secret Immich extras live in immich.env (see immich.env.example).
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+networks:
+  public_web:
+    name: public_web
+  proxy_net:
+    name: proxy_net
+  backend:
+    name: backend
+  # Internal-only network between the Docker socket proxy and its two clients
+  docker_api:
+    name: docker_api
+    internal: true
+
+services:
+  # --- Custom Dashboard API ---
+  kindle:
+    build: ./kindle
+    profiles: ["custom"]
+    container_name: kindle-dashboard
+    ports:
+      - "8200:8200"
+    restart: unless-stopped
+    pid: host
+    environment:
+      - CITY=Kraków
+      - LAT=50.0647
+      - LON=19.9450
+      - HOSTNAME_LABEL=jakaz homelab
+      - ROTATE=90
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # --- Public Web & Tunnels ---
+  website:
+    image: nginx:alpine
+    container_name: website
+    restart: unless-stopped
+    # public_web: reached by cloudflared; proxy_net: reached by Nginx Proxy Manager (local access)
+    networks:
+      - public_web
+      - proxy_net
+    volumes:
+      - ./website:/usr/share/nginx/html:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    networks:
+      - public_web
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+  # --- Immich Stack ---
+  # DB credentials come from .env (Compose does NOT use env_file values for ${...} interpolation).
+  # immich.env is optional and only for non-secret extras (e.g. DB_VECTOR_EXTENSION).
+  immich-postgres:
+    container_name: immich_postgres
+    image: pgvector/pgvector:pg14
+    restart: unless-stopped
+    networks:
+      - backend
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_DB: ${DB_DATABASE_NAME}
+    volumes:
+      - ${DB_DATA_LOCATION}:/var/lib/postgresql/data
+    shm_size: 128mb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME} -d ${DB_DATABASE_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
+
+  immich-machine-learning:
+    container_name: immich_machine_learning
+    image: ghcr.io/immich-app/immich-machine-learning:release
+    restart: unless-stopped
+    networks:
+      - backend
+    volumes:
+      - model-cache:/cache
+    env_file:
+      - path: ./immich.env
+        required: false
+    environment:
+      - MACHINE_LEARNING_WORKERS=1
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - OPENBLAS_NUM_THREADS=1
+      - VECLIB_MAXIMUM_THREADS=1
+      - NUMEXPR_NUM_THREADS=1
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+
+  immich-redis:
+    container_name: immich_redis
+    image: docker.io/valkey/valkey:9
+    restart: unless-stopped
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  immich-server:
+    container_name: immich_server
+    image: ghcr.io/immich-app/immich-server:release
+    restart: unless-stopped
+    networks:
+      - backend
+      - proxy_net
+    volumes:
+      - /mnt/red/immich:/usr/src/app/upload
+      - /etc/localtime:/etc/localtime:ro
+      - /mnt/red:/mnt/red
+      - /mnt/black:/mnt/black
+    env_file:
+      - path: ./immich.env
+        required: false
+    environment:
+      - TZ=${TZ}
+      - DB_HOSTNAME=immich-postgres
+      - DB_USERNAME=${DB_USERNAME}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_DATABASE_NAME=${DB_DATABASE_NAME}
+      - REDIS_HOSTNAME=immich-redis
+    depends_on:
+      immich-redis:
+        condition: service_healthy
+      immich-postgres:
+        condition: service_healthy
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+
+  # --- Proxy, DNS & Monitoring ---
+  npm:
+    image: jc21/nginx-proxy-manager:latest
+    container_name: npm
+    restart: unless-stopped
+    networks:
+      - proxy_net
+    ports:
+      - "80:80"
+      - "443:443"
+      # Admin UI only on the LAN address of this host (set LAN_IP in .env; falls back to loopback)
+      - "${LAN_IP:-127.0.0.1}:81:81"
+    volumes:
+      - ./npm/data:/data
+      - ./npm/letsencrypt:/etc/letsencrypt
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  pihole:
+    container_name: pihole
+    image: pihole/pihole:latest
+    restart: unless-stopped
+    networks:
+      - proxy_net
+    ports:
+      - "53:53/tcp"
+      - "53:53/udp"
+      - "8081:80/tcp"
+    environment:
+      TZ: ${TZ}
+      FTLCONF_webserver_api_password: ${PIHOLE_PASSWORD}
+      # Required on a Docker bridge network (current Pi-hole docs use upper case)
+      FTLCONF_dns_listeningMode: "ALL"
+      FTLCONF_misc_etc_dnsmasq_d: "true"
+    volumes:
+      - ./pihole/etc-pihole:/etc/pihole
+      - ./pihole/etc-dnsmasq.d:/etc/dnsmasq.d
+    healthcheck:
+      test: ["CMD", "dig", "+time=2", "@127.0.0.1", "pi.hole"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 150M
+
+  # Read-only Docker API for Homarr and Glances; only reachable on the internal docker_api network
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy
+    container_name: docker-socket-proxy
+    restart: unless-stopped
+    networks:
+      - docker_api
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      CONTAINERS: 1
+      INFO: 1
+      # POST stays 0 (read-only). If Homarr shows 403 errors, enable what it asks for;
+      # set POST: 1 only if you want start/stop actions.
+    read_only: true
+    tmpfs:
+      - /run
+      - /tmp
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 32M
+
+  homarr:
+    container_name: homarr
+    image: ghcr.io/homarr-labs/homarr:latest
+    restart: unless-stopped
+    networks:
+      - proxy_net
+      - docker_api
+    volumes:
+      - ./homarr/appdata:/appdata
+    environment:
+      SECRET_ENCRYPTION_KEY: ${HOMARR_KEY}
+      DOCKER_HOSTNAMES: docker-socket-proxy
+      DOCKER_PORTS: "2375"
+    depends_on:
+      - docker-socket-proxy
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 300M
+
+  glances:
+    image: nicolargo/glances:latest
+    container_name: glances
+    restart: unless-stopped
+    networks:
+      - proxy_net
+      - docker_api
+    pid: host
+    environment:
+      GLANCES_OPT: -w
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+    volumes:
+      - ${GLANCES_MOUNT_DIR}:/mnt:ro
+    depends_on:
+      - docker-socket-proxy
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 100M
+
+  homarr-iframes:
+    image: ghcr.io/diogovalentte/homarr-iframes:latest
+    container_name: homarr-iframes
+    restart: unless-stopped
+    networks:
+      - proxy_net
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+  uptime-kuma:
+    image: louislam/uptime-kuma:latest
+    container_name: uptime-kuma
+    restart: unless-stopped
+    networks:
+      - proxy_net
+      - backend
+    volumes:
+      - ./uptime-kuma:/app/data
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 150M
+
+  # --- Smart Home & Utilities ---
+  homeassistant:
+    container_name: homeassistant
+    image: ghcr.io/home-assistant/home-assistant:stable
+    volumes:
+      - ./homeassistant/config:/config
+      - /etc/localtime:/etc/localtime:ro
+    restart: unless-stopped
+    # Host networking is required for mDNS discovery and the Zigbee dongle
+    network_mode: host
+    devices:
+      - "${HA_USB_DEVICE}:/dev/ttyUSB0"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 500M
+
+  filebrowser:
+    container_name: filebrowser
+    image: filebrowser/filebrowser:latest
+    restart: unless-stopped
+    networks:
+      - proxy_net
+    user: "${PUID}:${PGID}"
+    volumes:
+      - ./filebrowser/filebrowser.db:/database/filebrowser.db
+      - ${FILEBROWSER_MOUNT_DIR}:/srv/mnt
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 80M
+
+  rss:
+    build: ./rss
+    profiles: ["custom"]
+    container_name: rss
+    restart: unless-stopped
+    networks:
+      - proxy_net
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    # Resolves via Cloudflare directly, bypassing Pi-hole
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+    volumes:
+      - ./rss/data:/app/data
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 80M
+
+  # --- VPN & Media ---
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    networks:
+      - proxy_net
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      VPN_SERVICE_PROVIDER: protonvpn
+      VPN_TYPE: wireguard
+      WIREGUARD_PRIVATE_KEY: ${PROTONVPN_PRIVATE_KEY}
+      SERVER_COUNTRIES: Switzerland
+      TZ: ${TZ}
+      VPN_INTERFACE_MTU: 1280
+      # CIDRs allowed to bypass the VPN (LAN + Tailscale nodes) so the WebUI stays reachable
+      FIREWALL_OUTBOUND_SUBNETS: ${FIREWALL_OUTBOUND_SUBNETS}
+      # ProtonVPN port forwarding: only use servers that support it and push the forwarded port
+      # into qBittorrent. Needs "Bypass authentication for clients on localhost" enabled in
+      # qBittorrent (Options -> WebUI) and a WireGuard key created with NAT-PMP enabled.
+      PORT_FORWARD_ONLY: "on"
+      VPN_PORT_FORWARDING: "on"
+      VPN_PORT_FORWARDING_UP_COMMAND: '/bin/sh -c ''wget -O- -nv --retry-connrefused --post-data "json={\"listen_port\":{{PORT}},\"random_port\":false,\"upnp\":false}" http://127.0.0.1:8080/api/v2/app/setPreferences'''
+    ports:
+      # qBittorrent WebUI (qBittorrent shares this container's network stack)
+      - 8090:8080
+    restart: unless-stopped
+    # Uses Gluetun's built-in healthcheck (no custom one)
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    restart: unless-stopped
+    environment:
+      PUID: ${PUID}
+      PGID: ${PGID}
+      TZ: ${TZ}
+      WEBUI_PORT: 8080
+    volumes:
+      - ./qbittorrent/config:/config
+      - ./qbittorrent/downloads:/downloads
+    # All traffic leaves through the Gluetun container (VPN kill switch)
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+
+  samba:
+    image: dperson/samba:latest
+    container_name: samba
+    restart: unless-stopped
+    networks:
+      - proxy_net
+    environment:
+      USER: ${SAMBA_USER}
+      SHARE: "Pobierane;/downloads;yes;no;no;all"
+      USERID: ${PUID}
+      GROUPID: ${PGID}
+    ports:
+      - "139:139"
+      - "445:445"
+    volumes:
+      - ./qbittorrent/downloads:/downloads
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 150M
+
+volumes:
+  model-cache:
