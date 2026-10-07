@@ -106,7 +106,7 @@ flowchart LR
 |---|---|---|---|---|
 | `website` | `nginx:alpine` | – | Static public site (via Cloudflare Tunnel, and via NPM on the LAN) | 64 MB |
 | `cloudflared` | `cloudflare/cloudflared` | – | Outbound tunnel to Cloudflare | 64 MB |
-| `immich-server` | `immich-server:release` | – | Photo management | 1536 MB |
+| `immich-server` | `immich-server:release` | – | Photo management | 2048 MB |
 | `immich-postgres` | `pgvector/pgvector:pg14` | – | Immich database | 1024 MB |
 | `immich-redis` | `valkey/valkey:9` | – | Immich cache and queues | 256 MB |
 | `immich-machine-learning` | `immich-machine-learning:release` | – | Face recognition, smart search | 1536 MB |
